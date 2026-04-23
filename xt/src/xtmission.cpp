@@ -6,32 +6,44 @@
 #include <xtmission.hpp>
 
 // 初始化一个mission
-void XTMission::missionInit(double alt)
+void XTMission::missionInit(double alt, double speed)
 {
-  nlohmann::json mission_json = {
-    {"version", 1},
-    {"mission", {
-      {"defaults", {
-        {"horizontalVelocity", 5.0},
-        {"maxHeadingRate", 60.0}
-      }},
-      {"items", nlohmann::json::array({
-        {{"type", "takeoff"},
-         {"altitude", alt}},
-        {{"type", "rtl"}}
-      })}
-    }}
-  };
-  const auto mission_init = px4_ros2::Mission(mission_json);
-  _mission_executor->setMission(mission_init);
+  std::lock_guard<std::mutex> lock(_mutex);
+  _mission_items.clear();
+  _defaults.trajectory_options.horizontal_velocity = speed;
+
+  px4_ros2::ActionItem action(
+    "takeoff",
+    px4_ros2::ActionArguments(
+      nlohmann::json{{"altitude",alt}}
+    )
+  );
+
+  _mission_items.emplace_back(action);
 }
 
-// 添加waypoint
+// 设置返航功能，输入返航高度
+// 注意：返航使用local坐标系，输入高度为相对高度即可(z为负值)
+void XTMission::addLandAction(const double alt, const double speed)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+
+  px4_ros2::ActionItem action(
+    "xtlandaction",
+    px4_ros2::ActionArguments(
+      nlohmann::json{{"altitude",alt},
+                    {"speed",speed}}
+  )
+  );
+
+  _mission_items.emplace_back(action);
+}
+
+// 添加waypoint，输入经纬高
+// 注意：mission中使用的坐标只能是global，意味着高度是AMSL，而不是NED高度，处理为gps.alt + 输入高度
 void XTMission::addWaypoint(double lat, double lon, double alt)
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  const auto& current_mission = _mission_executor->mission();
-  std::vector<px4_ros2::MissionItem> items = current_mission.items();
 
   px4_ros2::Waypoint wp(
     Eigen::Vector3d(lat,lon,alt),
@@ -40,53 +52,37 @@ void XTMission::addWaypoint(double lat, double lon, double alt)
 
   px4_ros2::NavigationItem nav(wp);
 
-  int insert_index;
-  for (int i = 0; i < static_cast<int>(items.size()); ++i) 
-  {
-    if (std::holds_alternative<px4_ros2::ActionItem>(items[i])) {
-      const auto& act = std::get<px4_ros2::ActionItem>(items[i]);
-      if (act.name == "rtl") {
-        insert_index = i;
-        break;
-      }
-    }
-  }
-  items.insert(items.begin() + insert_index, nav);
-
-  px4_ros2::Mission new_mission(items, current_mission.defaults());
-  _mission_executor->setMission(new_mission);
+  _mission_items.emplace_back(nav);
 }
 
-// 添加custom action
-void XTMission::addCustomAction(const double arg)
+// 添加custom action，输入投喂重量
+void XTMission::addCustomAction(const double weight)
 {
   std::lock_guard<std::mutex> lock(_mutex);
 
-  const auto& current_mission = _mission_executor->mission();
-  std::vector<px4_ros2::MissionItem> items = current_mission.items();
-
   px4_ros2::ActionItem action(
-    "basicCustomAction",
+    "xtbasicaction",
     px4_ros2::ActionArguments(
-      nlohmann::json{{"customArgument",arg}}
+      nlohmann::json{{"weight",weight}}
     )
   );
 
-  int insert_index;
-  for (int i = 0; i < static_cast<int>(items.size()); ++i) 
-  {
-    if (std::holds_alternative<px4_ros2::ActionItem>(items[i])) {
-      const auto& act = std::get<px4_ros2::ActionItem>(items[i]);
-      if (act.name == "rtl") {
-        insert_index = i;
-        break;
-      }
-    }
-  }
-  items.insert(items.begin() + insert_index, action);
+  _mission_items.emplace_back(action);
+}
 
-  px4_ros2::Mission new_mission(items, current_mission.defaults());
-  _mission_executor->setMission(new_mission);
+void XTMission::commitMission()
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+
+  // 在任务最后加入land，防止着陆后处于hold模式
+  px4_ros2::ActionItem action(
+    "land"
+  );
+
+  _mission_items.emplace_back(action);
+
+  px4_ros2::Mission mission(_mission_items, _defaults);
+  _mission_executor->setMission(mission);
 }
 
 void XTMission::publish_transponder_report(uint8_t node_id,double lat,double lon)
@@ -109,26 +105,83 @@ void XTMission::publish_transponder_report(uint8_t node_id,double lat,double lon
 		          px4_msgs::msg::TransponderReport::PX4_ADSB_FLAGS_RETRANSLATE;
 
 	_transponder_pub->publish(msg);
+
+  //每次更新transponder_report，维护_targets列表
+  std::cout<< "recv transponder" << msg.icao_address << std::endl;
+  bool found = false;
+  for(int i=0;i<_target_count;++i)
+	{
+		if(_targets[i].icao_address == msg.icao_address)
+		{
+			_targets[i] = msg;
+			found = true;
+			break;
+		}
+	}
+
+	if(!found && _target_count < MAX_TARGET)
+	{
+		_targets[_target_count++] = msg;
+	}
+
+	//为targets列表排序
+	for (int i = 0; i < _target_count - 1; ++i)
+	{
+		for (int j = i + 1; j < _target_count; ++j)
+		{
+			if (_targets[j].icao_address < _targets[i].icao_address)
+			{
+				auto tmp = _targets[i];
+				_targets[i] = _targets[j];
+				_targets[j] = tmp;
+			}
+		}
+	}
 }
 
 void XTMission::xt_process()
 {
-  if(_global_pos->positionValid())
+  if(!_global_pos->positionValid())
   {
-    Eigen::Vector3d pos = _global_pos->position();
-    if(doMission) // 测试建立mission,只执行一次
-    {
-      double lat1 = pos[0]+0.0005;
-      double lon1 = pos[1]+0.0005;
-      double lat2 = pos[0]+0.0005;
-      double lon2 = pos[1]-0.0005;
-      publish_transponder_report(1,lat1,lon1);
-      publish_transponder_report(2,lat2,lon2);
-      XTMission::missionInit(pos[2] + 5);
-      XTMission::addWaypoint(lat1,lon1,pos[2] + 5);
-      XTMission::addCustomAction(10.0f);
-      XTMission::addWaypoint(lat2,lon2,pos[2] + 5);
-      doMission = false;
-    }
+    RCLCPP_ERROR_ONCE(_node->get_logger(), "No valid global position!");
+    return;
   }
+  
+  Eigen::Vector3d pos = _global_pos->position();
+  double alt = 5.0f;
+  double speed = 3.0f;
+
+  if(!_mission_init_commit)
+  {
+    missionInit(pos[2]+alt, speed);
+    addWaypoint(pos[0], pos[1], pos[2]+alt);
+    addCustomAction(5.0f);
+    addLandAction(alt,speed);
+    commitMission();
+    _mission_init_commit = true;
+  }
+
+  XTserial::lora_struct lora_s;
+  if(_serial.get_data(lora_s))
+  {
+    publish_transponder_report(lora_s.node_id,
+                              static_cast<double>(lora_s.lat)/1e7,
+                              static_cast<double>(lora_s.lon)/1e7);
+  }
+
+  // 将targets列表生成mission，当targets数量变化时刷新一次
+  // TODO:根据控制软件指令生成mission,并获取相关参数
+  if(_last_commit_count != _target_count)
+    {
+      _last_commit_count = _target_count;
+
+      missionInit(pos[2]+alt, speed);
+      for(int i=0;i<_target_count;i++)
+      {
+        addWaypoint(_targets[i].lat, _targets[i].lon, pos[2] + alt);
+        addCustomAction((i+1)*5.0f);
+      }
+      addLandAction(alt,speed);
+      commitMission();
+    }
 }

@@ -22,37 +22,41 @@ bool waitForFMU(rclcpp::Node& node, const rclcpp::Duration& timeout,
   rclcpp::WaitSet wait_set;
   wait_set.add_subscription(vehicle_status_sub);
 
-  bool got_message = false;
-  auto start_time = node.now();
+  // bool got_message = false;
+  // auto start_time = node.now();
 
-  while (!got_message) {
-    auto now = node.now();
+  while (rclcpp::ok()) {
+  // while(!got_message){
+    // auto now = node.now();
 
-    if (now >= start_time + timeout) {
-      break;
-    }
+    // if (now >= start_time + timeout) {
+    //   break;
+    // }
 
-    auto wait_ret =
-        wait_set.wait((timeout - (now - start_time)).to_chrono<std::chrono::microseconds>());
+    auto wait_ret = wait_set.wait(std::chrono::seconds(1));
+    //    wait_set.wait((timeout - (now - start_time)).to_chrono<std::chrono::microseconds>());
 
     if (wait_ret.kind() == rclcpp::WaitResultKind::Ready) {
       px4_msgs::msg::VehicleStatus msg;
       rclcpp::MessageInfo info;
 
       if (vehicle_status_sub->take(msg, info)) {
-        got_message = true;
+    //    got_message = true;
+        wait_set.remove_subscription(vehicle_status_sub);
+        return true;
 
       } else {
         RCLCPP_DEBUG(node.get_logger(), "no VehicleStatus message received");
       }
 
-    } else {
-      RCLCPP_DEBUG(node.get_logger(), "timeout while waiting for FMU");
-    }
+    } 
+    // else {
+    //   RCLCPP_DEBUG(node.get_logger(), "timeout while waiting for FMU");
+    // }
   }
 
   wait_set.remove_subscription(vehicle_status_sub);
-  return got_message;
+  return false;
 }
 
 }  // namespace px4_ros2

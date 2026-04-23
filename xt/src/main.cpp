@@ -1,4 +1,5 @@
 #include <xtmission.hpp>
+#include <xtserial.hpp>
 
 static const std::string kNodeName = "xt_mission";
 static const bool kEnableDebugOutput = true;
@@ -19,7 +20,8 @@ int main(int argc, char* argv[])
     }
   }
 
-  const XTMission mission(node);
+  XTserial serial;
+  const XTMission mission(node,serial);
 
   rclcpp::spin(node);
   rclcpp::shutdown();

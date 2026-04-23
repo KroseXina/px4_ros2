@@ -15,19 +15,26 @@ find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(px4_ros2_cpp REQUIRED)
 
 include_directories(include ${Eigen3_INCLUDE_DIRS})
-add_executable(xt_pro src/main.cpp src/xtmission.cpp)
-target_link_libraries(xt_pro PUBLIC Eigen3::Eigen px4_ros2_cpp::px4_ros2_cpp rclcpp::rclcpp)
+add_executable(xt_pro src/main.cpp src/xtmission.cpp src/xtserial.cpp src/xtlandaction.cpp)
+ament_target_dependencies(xt_pro
+  rclcpp
+  geometry_msgs
+  Eigen3
+  px4_ros2_cpp
+)
+# target_link_libraries(xt_pro PUBLIC Eigen3::Eigen px4_ros2_cpp::px4_ros2_cpp rclcpp::rclcpp)
 
 install(TARGETS
         xt_pro
         DESTINATION lib/${PROJECT_NAME})
 
-if(BUILD_TESTING)
-    find_package(ament_lint_auto REQUIRED)
-    ament_lint_auto_find_test_dependencies()
-endif()
+# if(BUILD_TESTING)
+#     find_package(ament_lint_auto REQUIRED)
+#     ament_lint_auto_find_test_dependencies()
+# endif()
 
 ament_package()

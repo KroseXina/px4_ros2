@@ -3,6 +3,7 @@
 #include <px4_ros2/mission/mission_executor.hpp>
 #include <px4_ros2/third_party/nlohmann/json.hpp>
 #include <px4_ros2/vehicle_state/home_position.hpp>
+#include <px4_ros2/odometry/local_position.hpp>
 #include <px4_msgs/msg/home_position.hpp>
 #include <px4_ros2/control/setpoint_types/multicopter/goto.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -50,6 +51,9 @@ class XTLandAction : public px4_ros2::ActionInterface {
           if(arguments.contains("speed")) //若输入了速度指令则返回阶段使用输入速度
             _speed = arguments.at<double>("speed");
 
+          if(arguments.contains("home_z")) //必须包含home高度指令，否则降落识别随着home高度变化而失效
+            _home_z = arguments.at<float>("home_z");
+
           _on_completed = on_completed;
 
           if(!_home_pos.valid_lpos)
@@ -84,7 +88,7 @@ class XTLandAction : public px4_ros2::ActionInterface {
   bool _vision_valid{false};
 
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr _vision_enable_pub;
-  bool _vision_trig{false};
+  uint8_t _vision_trig{0};
 
   enum land_state
   {
@@ -97,6 +101,7 @@ class XTLandAction : public px4_ros2::ActionInterface {
 
   double _altitude{0.0f};
   double _speed{NAN};
+  float _home_z{NAN};
   px4_msgs::msg::HomePosition _home_pos{};
 
   void landstep();

@@ -24,7 +24,8 @@ void XTMission::missionInit(double alt, double speed)
 
 // 设置返航功能，输入返航高度
 // 注意：返航使用local坐标系，输入高度为相对高度即可(z为负值)
-void XTMission::addLandAction(const double alt, const double speed)
+// param:返航飞行高度  返航飞行速度  home点高度
+void XTMission::addLandAction(const double alt, const double speed, const float home_z)
 {
   std::lock_guard<std::mutex> lock(_mutex);
 
@@ -32,7 +33,8 @@ void XTMission::addLandAction(const double alt, const double speed)
     "xtlandaction",
     px4_ros2::ActionArguments(
       nlohmann::json{{"altitude",alt},
-                    {"speed",speed}}
+                    {"speed",speed},
+                    {"home_z",home_z}}
   )
   );
 
@@ -139,6 +141,44 @@ void XTMission::publish_transponder_report(uint8_t node_id,double lat,double lon
 	}
 }
 
+bool XTMission::computeStableAlt(double &mean_out)
+{
+    if (_alt_buf.size() < MIN_SAMPLES) return false;
+    double mean = 0;
+    for (double a: _alt_buf) mean += a;
+    mean /= _alt_buf.size();
+
+    double var = 0;
+    for (double a: _alt_buf) var += (a - mean) * (a - mean);
+    var /= _alt_buf.size();
+
+    double stddev = sqrt(var);
+    if (stddev < ALT_STD_TH) {
+        mean_out = mean;
+        return true;
+    }
+    return false;
+}
+
+bool XTMission::computeStableAltNed(float &mean_out)
+{
+    if (_local_alt_buf.size() < MIN_SAMPLES) return false;
+    float mean = 0;
+    for (float a: _local_alt_buf) mean += a;
+    mean /= _local_alt_buf.size();
+
+    float var = 0;
+    for (float a: _local_alt_buf) var += (a - mean) * (a - mean);
+    var /= _local_alt_buf.size();
+
+    float stddev = sqrt(var);
+    if (stddev < ALT_STD_TH) {
+        mean_out = mean;
+        return true;
+    }
+    return false;
+}
+
 void XTMission::xt_process()
 {
   if(!_global_pos->positionValid())
@@ -146,42 +186,90 @@ void XTMission::xt_process()
     RCLCPP_ERROR_ONCE(_node->get_logger(), "No valid global position!");
     return;
   }
-  
-  Eigen::Vector3d pos = _global_pos->position();
+  if(!_local_pos->positionXYValid())
+  {
+    RCLCPP_ERROR_ONCE(_node->get_logger(), "No valid local position!");
+    return;
+  }
+
   double alt = 5.0f;
   double speed = 3.0f;
 
-  if(!_mission_init_commit)
-  {
-    missionInit(pos[2]+alt, speed);
-    addWaypoint(pos[0], pos[1], pos[2]+alt);
-    addCustomAction(5.0f);
-    addLandAction(alt,speed);
-    commitMission();
-    _mission_init_commit = true;
-  }
+  Eigen::Vector3d pos = _global_pos->position();
+  float local_z = _local_pos->positionNed().z();
 
-  XTserial::lora_struct lora_s;
-  if(_serial.get_data(lora_s))
-  {
-    publish_transponder_report(lora_s.node_id,
-                              static_cast<double>(lora_s.lat)/1e7,
-                              static_cast<double>(lora_s.lon)/1e7);
-  }
+  _alt_buf.push_back(pos[2]);
+  if(_alt_buf.size() > 100)
+    _alt_buf.pop_front();
 
-  // 将targets列表生成mission，当targets数量变化时刷新一次
-  // TODO:根据控制软件指令生成mission,并获取相关参数
-  if(_last_commit_count != _target_count)
+  _local_alt_buf.push_back(local_z);
+  if(_local_alt_buf.size() > 100)
+    _local_alt_buf.pop_front();
+  
+  if(!_alt_locked)
+  {
+    double mean;
+    float meanNed;
+    if(!computeStableAlt(mean)) return;
+    _takeoff_alt_amsl = mean;
+    if(!computeStableAltNed(meanNed)) return;
+    _takeoff_alt_ned = meanNed;
+
+    _alt_locked = true;
+  }
+  if(_alt_locked)
+  {
+    double target_alt_amsl = _takeoff_alt_amsl + alt;
+
+    if(_arm_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
     {
-      _last_commit_count = _target_count;
-
-      missionInit(pos[2]+alt, speed);
-      for(int i=0;i<_target_count;i++)
+      if(!_mission_init_commit)
       {
-        addWaypoint(_targets[i].lat, _targets[i].lon, pos[2] + alt);
-        addCustomAction((i+1)*5.0f);
+        missionInit(target_alt_amsl, speed);
+        addWaypoint(pos[0], pos[1], target_alt_amsl);
+        addCustomAction(5.0f);
+        addLandAction(alt,speed,_takeoff_alt_ned);
+        commitMission();
+        _mission_init_commit = true;
       }
-      addLandAction(alt,speed);
-      commitMission();
+
+      XTserial::lora_struct lora_s;
+      if(_serial.get_data(lora_s))
+      {
+        publish_transponder_report(lora_s.node_id,
+                                  static_cast<double>(lora_s.lat)/1e7,
+                                  static_cast<double>(lora_s.lon)/1e7);
+      }
+
+      // 将targets列表生成mission，当targets数量变化时刷新一次
+      // TODO:根据控制软件指令生成mission,并获取相关参数
+      if(_last_commit_count != _target_count)
+        {
+          _last_commit_count = _target_count;
+
+          missionInit(target_alt_amsl, speed);
+          for(int i=0;i<_target_count;i++)
+          {
+            addWaypoint(_targets[i].lat, _targets[i].lon, target_alt_amsl);
+            addCustomAction((i+1)*5.0f);
+          }
+          addLandAction(alt,speed,_takeoff_alt_ned);
+          commitMission();
+        }
     }
+  }
+
+  if(_arm_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED)
+  {
+    _vehicle_armed = true;
+  }
+  if(_vehicle_armed && _arm_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
+  {
+    _vehicle_armed = false;
+    _mission_init_commit = false;
+    _alt_locked = false;
+    _alt_buf.clear();
+    _local_alt_buf.clear();
+  }
+
 }
